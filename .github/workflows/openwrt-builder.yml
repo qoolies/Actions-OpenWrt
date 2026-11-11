@@ -1,14 +1,8 @@
 #
 # https://github.com/P3TERX/Actions-OpenWrt (修改版)
-# File: .github/workflows/openwrt-bulder.yml
-# Description: Build OpenWrt using GitHub Actions
 #
-# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-
+# File: .github/workflows/openwrt-builder.yml
+# Description: Build OpenWrt (lede) using GitHub Actions
 #
 # 与模板的差异（见 REVIEW.md）：
 #   1. 增加 permissions，避免最后一两步因 token 权限不足变红
@@ -17,13 +11,17 @@
 #   3. 编译失败时自动上传 .config 与 logs，方便定位
 #   4. artifact 动作升级到 v4
 #
+
 name: OpenWrt Builder
+
 on:
   repository_dispatch:
   workflow_dispatch:
+
 permissions:
   contents: write
   actions: write
+
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
@@ -37,12 +35,15 @@ env:
   # 设为 true 时：只要有一个请求的包没进配置就直接失败（建议配合 review 使用）
   FAIL_ON_MISSING_PACKAGE: false
   TZ: Asia/Shanghai
+
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -57,22 +58,27 @@ jobs:
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
         df -hT /
+
     - name: Clone source code
       working-directory: /workdir
       run: |
         df -hT $PWD
         git clone $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
     - name: Load custom feeds
       run: |
         [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
         chmod +x $DIY_P1_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P1_SH
+
     - name: Update feeds
       run: cd openwrt && ./scripts/feeds update -a
+
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a
+
     - name: Load custom configuration
       run: |
         [ -e files ] && mv files openwrt/files
@@ -80,6 +86,7 @@ jobs:
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
+
     # ------------------------------------------------------------------
     # 关键补充步骤：记录你显式请求的每一项，defconfig 之后再逐项核对，
     # 被丢弃的选项会直接写进本次运行的 Summary。
@@ -90,13 +97,16 @@ jobs:
         cd openwrt
         cp .config /tmp/requested.config
         sed -n 's/^\(CONFIG_[A-Za-z0-9_.+-]*\)=[ym]$/\1/p' /tmp/requested.config | sort -u > /tmp/requested.list
+
         make defconfig 2>&1 | tee /tmp/defconfig.log
         grep -Ei 'warning|error|invalid' /tmp/defconfig.log > /tmp/defconfig.warn || true
+
         MISSING=""
         while IFS= read -r sym; do
           [ -z "$sym" ] && continue
           grep -q "^${sym}=[ym]$" .config || MISSING="$MISSING ${sym#CONFIG_}"
         done < /tmp/requested.list
+
         {
           echo "### 配置解析报告"
           echo ""
@@ -121,6 +131,7 @@ jobs:
             echo "</details>"
           fi
         } >> "$GITHUB_STEP_SUMMARY"
+
         if [ -n "$MISSING" ]; then
           echo "::warning::以下选项被丢弃：$MISSING"
           if [ "$FAIL_ON_MISSING_PACKAGE" = "true" ]; then
@@ -128,14 +139,29 @@ jobs:
             exit 1
           fi
         fi
+
         echo "=== 最终生效的关键项 ==="
         grep -E '^CONFIG_TARGET_(x86|IMAGES|ROOTFS|KERNEL)|^CONFIG_PACKAGE_(luci|kmod|adguard|tailscale|openclash)' .config | head -n 40
+
+        {
+          echo ""
+          echo "### 关键开关复核（含显式关闭项）"
+          echo ""
+          echo '```'
+          grep -E '(openclash|adguardhome|ssr-plus)' .config || echo "(以上三项均未出现在最终 .config)"
+          echo '```'
+          echo ""
+          echo "> 注意：lede 的 DEFAULT_PACKAGES.router 自带 13 个 luci 应用，"
+          echo "> 它们不会出现在上面的「请求的选项」里，但会真的编进固件。"
+        } >> "$GITHUB_STEP_SUMMARY"
+
     - name: Download package
       run: |
         cd openwrt
         make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
+
     - name: Compile the firmware
       id: compile
       run: |
@@ -146,6 +172,7 @@ jobs:
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
     - name: Report built images and packages
       if: (!cancelled())
       run: |
@@ -165,15 +192,48 @@ jobs:
             | grep -Ei 'luci-app-|luci-theme-|adguardhome|openclash|tailscale|ttyd|diskman|turboacc|istore|store' || echo "(没有匹配到，说明这些包根本没被编译)"
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
+
     - name: Check space usage
       if: (!cancelled())
       run: df -hT
+
     - name: Upload bin directory
       uses: actions/upload-artifact@v4
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: openwrt/bin
+
+    # ------------------------------------------------------------------
+    # 唯一能证明「某个包真的进了固件」的地方：bin/targets 下的包清单
+    # （bin/packages 只是编译产物，不代表被安装）
+    # 必须在 Organize files 的 rm -rf packages 之前执行
+    # ------------------------------------------------------------------
+    - name: Report packages installed into the image
+      if: (!cancelled())
+      run: |
+        cd openwrt
+        {
+          echo "### 真正装进固件的 luci 应用（bin/targets 包清单）"
+          echo ""
+          echo '```'
+          find bin/targets -type f \( -name 'luci-*.ipk' -o -name 'luci-*.apk' \) \
+            | sed 's|.*/||' | sort || true
+          echo '```'
+          echo ""
+          echo "### 对账：请求了但没进固件的"
+          echo ""
+          echo '```'
+          for p in luci-app-openclash luci-app-adguardhome adguardhome; do
+            if find bin/targets -type f \( -name "${p}_*.ipk" -o -name "${p}-*.apk" \) | grep -q .; then
+              echo "OK   $p"
+            else
+              echo "MISS $p"
+            fi
+          done
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
@@ -182,12 +242,14 @@ jobs:
         rm -rf packages
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
+
     - name: Upload firmware directory
       uses: actions/upload-artifact@v4
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
+
     - name: Upload build logs on failure
       uses: actions/upload-artifact@v4
       if: failure()
@@ -199,6 +261,7 @@ jobs:
           /tmp/defconfig.log
         if-no-files-found: ignore
         retention-days: 5
+
     - name: Generate release tag
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
@@ -206,6 +269,7 @@ jobs:
         echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
         touch release.txt
         echo "status=success" >> $GITHUB_OUTPUT
+
     - name: Upload firmware to release
       uses: softprops/action-gh-release@v2
       if: steps.tag.outputs.status == 'success' && !cancelled()
@@ -215,11 +279,13 @@ jobs:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
         files: ${{ env.FIRMWARE }}/*
+
     - name: Delete workflow runs
       uses: Mattraks/delete-workflow-runs@main
       with:
         retain_days: 0
         keep_minimum_runs: 2
+
     - name: Remove old Releases
       uses: dev-drprasad/delete-older-releases@master
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
@@ -228,5 +294,3 @@ jobs:
         delete_tags: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-# CONFIG_PACKAGE_luci-app-tailscale=y
-# ---------------------------------------------------------------------------

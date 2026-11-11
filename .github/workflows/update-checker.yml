@@ -4,10 +4,10 @@
 # File: .github/workflows/update-checker.yml
 # Description: Source code update checker
 #
-# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
+# 修改点：
+#   1. actions/cache v3 已弃用（官方 sunset），换成 v4
+#   2. peter-evans/repository-dispatch 升到 v3
+#   3. 增加 permissions，否则 repository-dispatch / 删除旧运行会因 token 权限不足报错
 #
 
 name: Update Checker
@@ -20,6 +20,10 @@ on:
   workflow_dispatch:
 #  schedule:
 #    - cron: 0 */18 * * *
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
   check:
@@ -35,7 +39,7 @@ jobs:
 
     - name: Compare Commit Hash
       id: cacheHash
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: .commitHash
         key: commitHash_${{ steps.getHash.outputs.commitHash }}
@@ -47,7 +51,7 @@ jobs:
 
     - name: Trigger build
       if: steps.cacheHash.outputs.cache-hit != 'true'
-      uses: peter-evans/repository-dispatch@v2
+      uses: peter-evans/repository-dispatch@v3
       with:
         token: ${{ github.token }}
         event-type: Source Code Update
