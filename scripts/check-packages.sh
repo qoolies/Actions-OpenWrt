@@ -116,6 +116,7 @@ if [ "$STAGE" = "pre" ]; then
 
     say "### 包存在性预检（feeds 装完之后、编译之前）"
     say ""
+    say "- 源码：\`${REPO_URL:-?}\` @ \`${REPO_BRANCH:-?}\`"
     say "- 在源码树里找到：**$OK** 个"
     say "- 找不到：**$(printf '%s' "$MISSING" | wc -w)** 个"
     say ""

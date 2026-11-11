@@ -3,8 +3,8 @@
 # File: diy-part2.sh
 # Description: feeds install 之后、make defconfig 之前执行；工作目录 = openwrt/
 #
-# 这里做「改源码」类的小动作：默认 IP、主机名、默认主题…
-# 每个动作都带存在性保护 —— 上游改了路径就打印 WARN 跳过，而不是静默失效。
+# 这里做「改源码」类的小动作：默认 IP、主机名、时区…
+# 每个动作都带存在性保护 —— 上游改了路径或换了默认值，就打印 WARN 跳过，而不是静默失效。
 #
 set -euo pipefail
 
@@ -15,48 +15,54 @@ ROUTER_HOSTNAME="${ROUTER_HOSTNAME:-MyRouter}"
 ROUTER_TIMEZONE="${ROUTER_TIMEZONE:-CST-8}"
 ROUTER_ZONENAME="${ROUTER_ZONENAME:-Asia/Shanghai}"
 
-# replace_in_file <文件> <原文> <新文> <说明>
-replace_in_file() {
-    local f="$1" old="$2" new="$3" desc="$4"
+# replace_any <文件> <新值串> <说明> <候选旧值1> [候选旧值2 ...]
+# 命中第一个就替换并停止；一个都没命中才警告一次（避免刷一屏黄条）
+replace_any() {
+    local f="$1" new="$2" desc="$3"
+    shift 3
     if [ ! -f "$f" ]; then
-        echo "::warning::$f 不存在，跳过：$desc（上游可能改了路径，确认后再改）"
+        echo "::warning::$f 不存在，跳过：$desc（上游可能改了路径）"
         return 0
     fi
-    if ! grep -qF -- "$old" "$f"; then
-        echo "::warning::$f 里找不到「$old」，跳过：$desc"
-        return 0
-    fi
-    sed -i "s|${old}|${new}|g" "$f"
-    echo "  ✔ $desc"
+    local o
+    for o in "$@"; do
+        if grep -qF -- "$o" "$f"; then
+            sed -i "s|${o}|${new}|g" "$f"
+            echo "  ✔ $desc（原值 ${o}）"
+            return 0
+        fi
+    done
+    echo "::warning::$f 里找不到「$*」，跳过：$desc"
 }
 
 GEN=package/base-files/files/bin/config_generate
 
 # ---------- 默认 LAN IP ----------
-replace_in_file "$GEN" '192.168.1.1' "$LAN_IP" "默认 LAN IP → $LAN_IP"
+replace_any "$GEN" "$LAN_IP" "默认 LAN IP" '192.168.1.1'
 
 # ---------- 默认主机名 ----------
-# lede 用的是 LEDE，上游 openwrt 是 OpenWrt；两个都试，找不到只警告不中断
-replace_in_file "$GEN" "hostname='LEDE'" "hostname='${ROUTER_HOSTNAME}'" "默认主机名 → $ROUTER_HOSTNAME"
-replace_in_file "$GEN" "hostname='OpenWrt'" "hostname='${ROUTER_HOSTNAME}'" "默认主机名 → $ROUTER_HOSTNAME"
+# 不同源码默认值不同：lede=LEDE、官方 openwrt=OpenWrt、ImmortalWrt=ImmortalWrt
+replace_any "$GEN" "hostname='${ROUTER_HOSTNAME}'" "默认主机名" \
+    "hostname='LEDE'" "hostname='OpenWrt'" "hostname='ImmortalWrt'"
 
 # ---------- 默认时区 ----------
-replace_in_file "$GEN" "timezone='GMT0'" "timezone='${ROUTER_TIMEZONE}'" "默认时区 → $ROUTER_TIMEZONE"
-replace_in_file "$GEN" "zonename='UTC'" "zonename='${ROUTER_ZONENAME}'" "默认时区名 → $ROUTER_ZONENAME"
+replace_any "$GEN" "timezone='${ROUTER_TIMEZONE}'" "默认时区" "timezone='GMT0'"
+replace_any "$GEN" "zonename='${ROUTER_ZONENAME}'" "默认时区名" "zonename='UTC'"
 
 # ---------- 其它常用动作（按需取消注释）----------
 #
 # 默认主题换成 argon（前提：config/packages.txt 里有 luci-theme-argon）
-# replace_in_file feeds/luci/collections/luci/Makefile 'luci-theme-bootstrap' 'luci-theme-argon' "默认主题 → argon"
+# replace_any feeds/luci/collections/luci/Makefile 'luci-theme-argon' "默认主题 → argon" 'luci-theme-bootstrap'
 #
-# 改默认 root 密码（默认是空的，只能靠首次登录设置；这个值要写 sha512 或明文）
-# sed -i "s|^root:.*|root:\$1\$xxxx$(date +%s)yyyy\$/|" package/base-files/files/etc/shadow
+# 强制用外部源的版本（详见 README「强制用外部源的版本」）
+# ./scripts/feeds uninstall luci-app-passwall
+# ./scripts/feeds install -p small luci-app-passwall
 #
 # 精简固件体积：直接删掉不要的包目录（比在 .config 里关更快更干净）
 # rm -rf feeds/luci/applications/luci-app-nlbwmon
 # rm -rf feeds/luci/applications/luci-app-vlmcsd
 #
-# 打补丁：把 .patch 放进 patch/ 同名目录，然后在这里 apply
+# 打补丁：把 .patch 放进 patch/ 目录，然后在这里 apply
 # patch -p1 < "$GITHUB_WORKSPACE/patches/01-foo.patch"
 
 echo "=== diy-part2.sh 完成 ==="

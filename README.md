@@ -148,6 +148,37 @@ istore  https://github.com/istoreos/istore.git flatten=luci
 注意 `uninstall` 会触发一次 `make prepare-tmpinfo`，整体多花 10–25 秒。
 预检的「包的来源」表会告诉你到底生效的是哪一个 —— 加源没生效时这里一眼看得出来。
 
+### 换源码仓库（官方 OpenWrt / ImmortalWrt）
+
+先不改文件试跑：Run workflow 时填 `source_repo` + `source_branch`，例如
+
+| 目标 | source_repo | source_branch |
+|---|---|---|
+| lede（当前） | `https://github.com/coolsnowwolf/lede` | `master` |
+| 官方 OpenWrt | `https://github.com/openwrt/openwrt` | `openwrt-25.12` |
+| ImmortalWrt | `https://github.com/immortalwrt/immortalwrt` | `openwrt-25.12` |
+
+预检报告第一行会写「源码：xxx @ xxx」，确认没跑偏；确认 OK 后再把 workflow 里的
+`DEFAULT_REPO` / `DEFAULT_BRANCH` 改掉固化。
+
+换源码要重新核对的东西（以 ImmortalWrt 25.12 为例，2026-11 实测链接）：
+
+| 项 | 结论 |
+|---|---|
+| `luci-app-openclash`、`luci-app-adguardhome` | ✅ [immortalwrt/luci](https://github.com/immortalwrt/luci/tree/master/applications) 里都有 |
+| `adguardhome` 本体 | ✅ [immortalwrt/packages](https://github.com/immortalwrt/packages/tree/master/net/adguardhome) 里有 |
+| `luci-app-ssr-plus` | ❌ 没有（lede 的 helloworld feed 特有）→ 把 `packages.txt` 里 `!luci-app-ssr-plus` 删掉即可 |
+| feeds | 各家自带 `feeds.conf.default`（ImmortalWrt 的 packages/luci 是自家 fork），我们仓库没有覆盖文件，会自动用它的 |
+| 机型符号 | x86_64 generic 基本一致，第一次跑完在「最终生效的关键项」里确认 |
+| 默认主机名 | lede 是 `LEDE`、ImmortalWrt 是 `ImmortalWrt`，`diy-part2.sh` 已三个都试 |
+
+### 不要把另一个发行版当 feed 加进来
+
+`feeds install -a` 是先到先得：重叠的包全被 lede 抢先，**加了等于没加**；
+只有 lede 没有的包会被装进来，而它们依赖的 `luci-lib-*` / `ucode-mod-*`
+往往在 lede 这边不存在，结果要么编译失败、要么被 defconfig 静默丢弃。
+**要换发行版就换源码仓库，别混 feed。**
+
 ### 砍体积
 
 - 小的：`config/extra.config` 里关掉用不上的默认包（vsftpd / vlmcsd / nlbwmon / wol …）
