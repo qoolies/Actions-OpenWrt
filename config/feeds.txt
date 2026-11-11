@@ -1,0 +1,28 @@
+# ===========================================================================
+# 额外 feed 清单 —— 「预检说包找不到」时的第一处理方案
+#
+# 每行一个 feed，空格分隔：  名字  URL  [第三列]
+#   · 第三列写 flatten=xxx  ：该仓库不是标准 feed 布局（包埋在子目录里），
+#                             把 xxx/ 下的包目录摊平到 package/
+#   · 第三列写其它内容      ：当作分支，等价于 feeds.conf 里的 ;分支
+#   · 行首 # 是注释
+#
+# 加完之后，把要装的包名写进 config/packages.txt。
+# diy-part1.sh 会读这个文件，重复执行安全（同名 feed 只更新 URL）。
+# ===========================================================================
+
+# ----- 科学上网 -----
+# passwall  https://github.com/xiaorouji/openwrt-passwall
+# passwall2 https://github.com/xiaorouji/openwrt-passwall2
+
+# ----- 大杂烩 feed（几十个插件，和 lede 有重名冲突风险，装之前先想清楚）-----
+# small     https://github.com/kenzok8/small
+
+# ----- mihomo 内核 + LuCI 界面 -----
+# mihomo    https://github.com/morytyann/OpenWrt-mihomo
+
+# ----- iStore 应用商店（非标准布局，必须 flatten）-----
+# istore    https://github.com/istoreos/istore.git flatten=luci
+
+# ----- 把自己的包钉在 fork 上（免得上游改坏导致编译失败）-----
+# mine      https://github.com/qoolies/my-packages main

@@ -56,22 +56,49 @@ if [ "$STAGE" = "pre" ]; then
     pkg_dirs >"$DIRS"
     kmod_names >"$KMODS"
 
+    # 每个 feed 提供哪些包（feeds update 之后会生成 feeds/<名字>.index）
+    # 用来回答「这个包到底是从哪个源来的、有没有被别的源也提供了」
+    IDXDIR="$(mktemp -d)"
+    for idx in "$OPENWRT"/feeds/*.index; do
+        [ -e "$idx" ] || continue
+        f="$(basename "$idx" .index)"
+        grep -hs '^Package: ' "$idx" 2>/dev/null | sed 's/^Package: //' | tr -d '\r' |
+            sed -e 's/[[:space:]]*$//' | sort -u >"$IDXDIR/$f"
+    done
+    sources_of() {  # $1=包名 → 空格分隔的来源列表，按 feeds.conf 顺序，core 第一
+        local p="$1" out="" f
+        [ -d "$OPENWRT/package/$p" ] && out="core"
+        for f in "$IDXDIR"/*; do
+            [ -e "$f" ] || continue
+            if grep -qxF "$p" "$f"; then out="$out $(basename "$f")"; fi
+        done
+        printf '%s' "${out# }"
+    }
+    MULTI=""
+
     MISSING=""
     DROPPED_DISABLE=""
     KMOD_MAYBE=""
     OK=0
+    SOURCE_LINES=""
 
     while IFS='=' read -r name val; do
         [ -z "${name:-}" ] && continue
         val="${val//$'\r'/}"
         if grep -qxF "$name" "$DIRS"; then
             OK=$((OK + 1))
+            srcs="$(sources_of "$name")"
+            [ "$(printf '%s' "$srcs" | wc -w)" -ge 2 ] && MULTI="$MULTI $name"
+            SOURCE_LINES="$SOURCE_LINES| \`$name\` | ${srcs:-?} |
+"
             continue
         fi
         case "$name" in
             kmod-*)
                 if grep -qxF "${name#kmod-}" "$KMODS"; then
                     OK=$((OK + 1))
+                    SOURCE_LINES="$SOURCE_LINES| \`$name\` | kmod（内核模块定义） |
+"
                 else
                     # 源码树里没有独立的 kmod-xxx 定义：可能已内建进内核
                     KMOD_MAYBE="$KMOD_MAYBE $name"
@@ -86,7 +113,6 @@ if [ "$STAGE" = "pre" ]; then
                 ;;
         esac
     done <"$REQ"
-    rm -f "$DIRS" "$KMODS"
 
     say "### 包存在性预检（feeds 装完之后、编译之前）"
     say ""
@@ -96,15 +122,62 @@ if [ "$STAGE" = "pre" ]; then
     if [ -n "$MISSING" ]; then
         say "**找不到的包 —— 名字写错 / feed 没加 / 该分支已移除：**"
         say ""
-        for p in $MISSING; do say "- \`$p\`"; done
+        for p in $MISSING; do
+            base="${p#luci-app-}"
+            base="${base#luci-}"
+            base="${base#kmod-}"
+            say "- \`$p\`"
+            if [ "${#base}" -ge 4 ]; then
+                sug=""
+                while IFS= read -r d; do
+                    cb="${d#luci-app-}"
+                    cb="${cb#luci-}"
+                    cb="${cb#kmod-}"
+                    [ "${#cb}" -ge 4 ] || continue
+                    [ "${cb:0:4}" = "${base:0:4}" ] || continue
+                    diff=$(( ${#cb} - ${#base} ))
+                    [ "$diff" -lt 0 ] && diff=$((0 - diff))
+                    [ "$diff" -le 3 ] || continue
+                    sug="$sug \`$d\`"
+                done <"$DIRS"
+                [ -n "$sug" ] && say "  - 近似名（多半是拼错）：$sug"
+            fi
+        done
         say ""
-        say "> 这些包不会让编译失败，只会「绿勾但固件里没有」。"
-        say "> 多数是 feed 里确实没有（比如 luci-app-turboacc 在 25.12 分支被移除），"
-        say "> 或者需要先在 \`diy-part1.sh\` 里加 feed。"
+        say "> 这些包不会让编译失败，只会「绿勾但固件里没有」。三种处理方式："
+        say "> 1. 包在别的仓库里 → 在 \`config/feeds.txt\` 加一行 feed（脚本会自动读取）"
+        say "> 2. 只是拼错 → 照上面的「近似名」改 \`config/packages.txt\`"
+        say "> 3. 这个分支确实没有了（如 \`luci-app-turboacc\` 在 25.12 被移除）→ 从清单里删掉"
         echo "::warning::以下包在源码树里找不到：$MISSING"
     else
         say "请求的包全部在源码树里 ✅"
     fi
+
+    # ----- 每个包来自哪个源 -----
+    # feeds install -a 是「先到先得」：feeds.conf 里排在前面的 feed 优先，
+    # 核心包 package/ 优先级最高。我们把额外 feed 追加在最后，所以默认源天然优先。
+    # 这里把结果摊开，免得「以为加了源就换了包，其实没换」。
+    if [ -n "$SOURCE_LINES" ]; then
+        say ""
+        say "<details><summary>包的来源（feeds.conf 顺序优先，默认源在前）</summary>"
+        say ""
+        say "| 包 | 来源 |"
+        say "|---|---|"
+        printf '%s' "$SOURCE_LINES" | tee -a "$REPORT"
+        say ""
+        say "</details>"
+    fi
+    if [ -n "$MULTI" ]; then
+        say ""
+        say "**同一个包被多个源提供：**"
+        for p in $MULTI; do say "- \`$p\` ← $(sources_of "$p")"; done
+        say ""
+        say "> 按 feeds.conf 的顺序取第一个（默认源在前 → 默认源生效）。"
+        say "> 想让外部源的版本生效，见 README「强制用外部源的版本」。"
+        echo "::notice::以下包在多个源里都有，按顺序取第一个：$MULTI"
+    fi
+    rm -f "$DIRS" "$KMODS"
+    rm -rf "$IDXDIR"
     if [ -n "$KMOD_MAYBE" ]; then
         say ""
         say "**待确认的内核模块（可能已内建进内核，属正常）：**"

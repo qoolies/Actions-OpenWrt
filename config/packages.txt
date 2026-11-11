@@ -39,7 +39,8 @@ kmod-virtio-net
 # tailscale 只有本体、没有 LuCI 界面：写 tailscale 能装上，界面得命令行配
 #   tailscale
 #
-# iStore 不在任何 lede feed 里，必须先打开 diy-part1.sh 里的 add_flat_feed 那行，
+# iStore 不在任何 lede feed 里，先在 config/feeds.txt 里加
+#   istore  https://github.com/istoreos/istore.git flatten=luci
 # 再取消下面这行的注释，否则包名找不到：
 #   luci-app-store
 # ===========================================================================

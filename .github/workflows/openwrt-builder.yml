@@ -72,9 +72,8 @@ env:
   KEEP_RELEASES: "3"
   ARTIFACT_RETENTION: "14"
 
-  CCACHE_DIR: /workdir/.ccache
+  CCACHE_DIR: /workdir/openwrt/.ccache
   CCACHE_MAXSIZE: 3G
-  CCACHE_COMPRESS: "true"
 
 jobs:
   build:
@@ -82,7 +81,7 @@ jobs:
     # 想提前迁到 ubuntu-24.04 / 26.04，只改这一行：
     # 下面的初始化步骤会自动跳过新系统里不存在的 apt 包，不用改包列表。
     runs-on: ubuntu-22.04
-    timeout-minutes: 350
+    timeout-minutes: 240
 
     steps:
     - name: Checkout
@@ -178,7 +177,11 @@ jobs:
       if: env.USE_CCACHE == 'true'
       uses: actions/cache@v6
       with:
-        path: /workdir/.ccache
+        # 注意：lede 的 rules.mk 里是无条件 `export CCACHE_DIR=$(TOPDIR)/.ccache`
+        # （见 include 里的 CCACHE 段），环境变量会被它覆盖 —— 所以缓存必须放在
+        # openwrt/.ccache，放在 /workdir/.ccache 会「缓存永远是空的」。
+        # 上面的 env.CCACHE_DIR 与之保持一致，只是为了 `ccache -s` 能读到同一份统计。
+        path: /workdir/openwrt/.ccache
         # key 绑上游 commit：源码没变就复用同一份缓存，变了也能靠 restore-keys 命中旧对象
         key: ccache-${{ env.REPO_BRANCH }}-${{ env.UPSTREAM_SHA }}-${{ github.run_id }}
         restore-keys: |
@@ -280,10 +283,28 @@ jobs:
 
         ccache -s 2>/dev/null || true
         echo "status=success" >> "$GITHUB_OUTPUT"
-
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
         if [ -s DEVICE_NAME ]; then echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"; fi
         echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
+    # ccache 到底有没有生效，只能看这里：命中率 0% 或体积 0 说明缓存没接上
+    - name: Report ccache stats
+      if: env.USE_CCACHE == 'true'
+      run: |
+        {
+          echo ""
+          echo "### ccache"
+          echo ""
+          echo "- 目录 \`$CCACHE_DIR\`，体积 $(du -sh "$CCACHE_DIR" 2>/dev/null | cut -f1 || echo '(未生成)')"
+          echo ""
+          echo '```'
+          ccache -s 2>/dev/null || echo "(ccache 未安装，本次没有缓存)"
+          echo '```'
+          echo ""
+          echo "> lede 的 rules.mk 会强制 \`export CCACHE_DIR=$(TOPDIR)/.ccache\`，"
+          echo "> 所以缓存目录只能是 \`openwrt/.ccache\`，写别处会「看起来配了、实际全量编译」。"
+          echo ""
+        } >> "$GITHUB_STEP_SUMMARY" || true
 
     # ---------------------------------------------------------------- 报告
     - name: Report images and really-installed packages
@@ -338,6 +359,9 @@ jobs:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
         retention-days: ${{ env.ARTIFACT_RETENTION }}
+        # 产物本身已经是 .img.gz，再 zip 压缩纯属浪费 1~2 分钟 CPU
+        compression-level: 0
+        if-no-files-found: error
 
     - name: Upload build logs on failure
       uses: actions/upload-artifact@v7

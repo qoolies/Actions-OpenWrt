@@ -67,11 +67,22 @@ luci-app-openclash          # 启用
 
 把 `STRICT` 改成 `"true"`，任何一项不合预期都直接失败，而不是黄字警告。
 
-### 2.3 ccache：第二次构建起明显变快
+### 2.3 ccache：第二次构建起明显变快（第一版接了但没生效，已修）
 
-- 缓存目录 `/workdir/.ccache`，`config/base.config` 里 `CONFIG_CCACHE=y`
+> 实测教训：第一版的缓存路径写成 `/workdir/.ccache`，结果 `actions/caches` 里
+> `total_count: 0` —— 一个字节都没存。原因见下，已在 v2 修正。
+
+- lede 的 `rules.mk` 里是**无条件赋值**：`export CCACHE_DIR:=$(TOPDIR)/.ccache`，
+  所以环境变量里的 `CCACHE_DIR` 会被覆盖，缓存必须放在 `openwrt/.ccache`
+- `CCACHE_NOCOMPRESS:=true` 由 rules.mk 强制，缓存不压缩，全量约 3–5 GB
 - key = `ccache-<分支>-<上游commit>-<run_id>`，`restore-keys` 先回退到同 commit、再回退到同分支
-- 上限 3G（`CCACHE_MAXSIZE`），压缩开启
+- 上限 3G（`CCACHE_MAXSIZE`）
+- Summary 里新增 ccache 命中率/体积，命中率为 0 或体积为 0 就说明没接上
+
+### 2.3.1 额外 feed 改成声明式（`config/feeds.txt`）
+
+原来要在 `diy-part1.sh` 里改 shell；现在加源只是往 `config/feeds.txt` 写一行，
+支持 `flatten=子目录`（iStore 那类非标准布局）和第三列当分支。
 
 这样「只改了两三个包」的重编不会从零开始；源码没变时命中率最高。
 

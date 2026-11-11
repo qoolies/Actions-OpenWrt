@@ -12,9 +12,10 @@
 | 路径 | 作用 | 什么时候改 |
 |---|---|---|
 | `config/packages.txt` | 插件清单，一行一个包名，`!` 开头 = 显式关闭 | **加 / 删插件（90% 的改动）** |
+| `config/feeds.txt` | 额外 feed（含 iStore 这种非标准布局） | 包找不到、要换源时 |
 | `config/base.config` | 机型、分区大小、镜像格式、ccache | 换设备、改磁盘大小 |
 | `config/extra.config` | 其它零散 `CONFIG_*`（默认全注释 = 不改） | 关 IPv6、换主题、砍体积 |
-| `diy-part1.sh` | feeds update **之前**：加 feed、摊平 iStore | 要装第三方源里的包 |
+| `diy-part1.sh` | 读取 `config/feeds.txt`、摊平非标准 feed | 一般不用动（改 feeds.txt 就够） |
 | `diy-part2.sh` | feeds install **之后**：默认 IP / 主机名 / 时区 | 改固件出厂默认值 |
 | `scripts/gen-config.sh` | 把上面三份配置拼成 `openwrt/.config` | 一般不用动 |
 | `scripts/check-packages.sh` | 编译前预检 + defconfig 后对账 | 一般不用动 |
@@ -109,24 +110,43 @@ ROUTER_TIMEZONE="${ROUTER_TIMEZONE:-CST-8}"
 
 ### 加第三方 feed
 
-`diy-part1.sh` 里取消注释一行即可：
+`config/feeds.txt` 里取消注释一行即可：
 
-```sh
-add_feed passwall https://github.com/xiaorouji/openwrt-passwall
+```text
+passwall  https://github.com/xiaorouji/openwrt-passwall
 ```
 
-重复执行安全（已存在就改 URL）。加完记得把包名写进 `config/packages.txt`。
+加完把包名写进 `config/packages.txt`。重复执行安全（同名 feed 只更新 URL）。
+
+"包找不到"时的判断顺序：
+1. 名字拼错了？预检会给近似名
+2. 包在别的仓库？→ 上面这样加 feed
+3. 该分支确实移除了（如 `luci-app-turboacc` 在 luci@25.12 被移除）→ 删掉这一行
 
 ### 装 iStore 应用商店
 
-iStore 的仓库不是标准 feed 布局（包埋在 `luci/` 子目录），要「摊平」：
+iStore 的仓库不是标准 feed 布局（包埋在 `luci/` 子目录），用 `flatten=` 让它摊平：
 
-```sh
-# diy-part1.sh
-add_flat_feed https://github.com/istoreos/istore.git luci
+```text
+istore  https://github.com/istoreos/istore.git flatten=luci
 ```
 
 然后 `config/packages.txt` 里启用 `luci-app-store`。
+
+### 强制用外部源的版本（覆盖默认源）
+
+`feeds install -a` 是**先到先得**：`feeds.conf` 里靠前的 feed 优先，核心包（`package/`）又高于所有 feed。
+额外 feed 是追加在最后的，所以**默认源永远赢** —— 这是特性，不是 bug。
+
+想要外部源的版本生效（比如你 fork 了某个包修了个 bug），在 `diy-part2.sh` 里写两行：
+
+```sh
+./scripts/feeds uninstall luci-app-passwall       # 删掉默认源那份
+./scripts/feeds install -p small luci-app-passwall  # 从 small 源装
+```
+
+注意 `uninstall` 会触发一次 `make prepare-tmpinfo`，整体多花 10–25 秒。
+预检的「包的来源」表会告诉你到底生效的是哪一个 —— 加源没生效时这里一眼看得出来。
 
 ### 砍体积
 
@@ -162,4 +182,9 @@ lede master 每天在变。要稳定就钉版本：
 - **`feeds.conf.default` 写错会在 `Update feeds` 一秒内失败**。格式是 `src-git <名字> <URL>[;<分支>]`。
 - **`bin/packages` 不等于装了包**：那只是编译出来的 ipk/apk；判断有没有进固件只看 `bin/targets` 下的清单。
 - **lede 默认主机名是 `LEDE`，不是 `OpenWrt`**，默认时区是 `GMT0`/`UTC`。
+- **ccache 目录不能随便放**：lede 的 `rules.mk` 里是无条件 `export CCACHE_DIR=$(TOPDIR)/.ccache`，
+  环境变量会被它覆盖。所以缓存必须放在 `openwrt/.ccache`，放别处就是"配了但每次都全量编译"。
+- **同名包不会互相打架**：`feeds install -a` 是先到先得，`feeds.conf` 里靠前的 feed 优先，
+  核心包（`package/`）又高于所有 feed。额外 feed 追加在最后，所以默认源天然优先；
+  预检的「包的来源」表会列出每个包最终来自哪个源。
 - 当前 lede 的 luci feed 锁在 **openwrt-25.12** 分支：`luci-app-turboacc`、`luci-app-accesscontrol` 在该分支已被移除，写了也只会进「找不到」报告。
