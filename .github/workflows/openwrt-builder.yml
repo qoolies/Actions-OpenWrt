@@ -1,77 +1,198 @@
 #
-# https://github.com/P3TERX/Actions-OpenWrt (修改版)
-#
 # File: .github/workflows/openwrt-builder.yml
-# Description: Build OpenWrt (lede) using GitHub Actions
+# Description: Build OpenWrt (coolsnowwolf/lede) with GitHub Actions
 #
-# 与模板的差异（见 REVIEW.md）：
-#   1. 增加 permissions，避免最后一两步因 token 权限不足变红
-#   2. 把 make defconfig 单独拆成一步，并输出「请求的选项 vs 实际生效」报告
-#      —— 这是唯一能发现「编译成功但插件被静默丢掉」的手段
-#   3. 编译失败时自动上传 .config 与 logs，方便定位
-#   4. artifact 动作升级到 v4
+# 编排原则（与 P3TERX 模板 / ophub 等仓库对比后的取舍，详见 UPGRADE.md）：
+#   1. 配置分成 config/base.config + config/packages.txt，由 scripts/gen-config.sh 拼成 .config
+#      —— 日常只改 packages.txt，不用碰 Kconfig 语法
+#   2. 编译前先做「包存在性预检」（5 秒），把「绿勾但插件没进固件」提前到编译前暴露
+#   3. ccache 缓存（key 绑上游 commit），第二次起只重编改动部分
+#   4. 所有 action 锁大版本；删除旧运行/旧 release 改用 gh API，不再依赖两个已停更的第三方 action
+#   5. 运行参数（源码/分支/临时加包/是否发 release）走 workflow_dispatch 输入，改配置不必改文件
 #
 
 name: OpenWrt Builder
 
 on:
   repository_dispatch:
+    types: [Source Code Update]
   workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "源码仓库（留空 = 下面 env.DEFAULT_REPO）"
+        required: false
+        default: ""
+      source_branch:
+        description: "源码分支或 tag（留空 = env.DEFAULT_BRANCH；填 tag 可锁版本）"
+        required: false
+        default: ""
+      extra_packages:
+        description: "本次临时追加的包，空格分隔（如 luci-app-ttyd；! 前缀表示关闭）"
+        required: false
+        default: ""
+      release:
+        description: "构建成功后发布 Release"
+        type: boolean
+        default: false
+      use_ccache:
+        description: "使用 ccache 缓存（第二次构建起明显变快）"
+        type: boolean
+        default: true
+      debug_ssh:
+        description: "失败时开 tmate SSH 进运行环境排查"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
   actions: write
 
+# 编译很贵：同一分支只保留最新一次，避免排队跑两遍
+concurrency:
+  group: openwrt-build-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  REPO_URL: https://github.com/coolsnowwolf/lede
-  REPO_BRANCH: master
+  # ===== 默认源码：只改这两行；update-checker.yml 里要保持一致 =====
+  DEFAULT_REPO: https://github.com/coolsnowwolf/lede
+  DEFAULT_BRANCH: master
+
   FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: false
-  # 设为 true 时：只要有一个请求的包没进配置就直接失败（建议配合 review 使用）
-  FAIL_ON_MISSING_PACKAGE: false
   TZ: Asia/Shanghai
+
+  # 上传固件目录（bin/targets/*/*）。想连 bin 一起传就再加一步，不建议（几百 MB）
+  UPLOAD_FIRMWARE: true
+
+  # true = 有包找不到 / 被 defconfig 丢弃时直接让构建失败（默认只黄字警告）
+  STRICT: "false"
+  # 保留最近几次运行 / 几个 release，其余连 artifact 一起清掉
+  KEEP_RUNS: "3"
+  KEEP_RELEASES: "3"
+  ARTIFACT_RETENTION: "14"
+
+  CCACHE_DIR: /workdir/.ccache
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPRESS: "true"
 
 jobs:
   build:
+    # ubuntu-22.04 自 2026-09-17 进入弃用期（2027-04-17 下线）。
+    # 想提前迁到 ubuntu-24.04 / 26.04，只改这一行：
+    # 下面的初始化步骤会自动跳过新系统里不存在的 apt 包，不用改包列表。
     runs-on: ubuntu-22.04
+    timeout-minutes: 350
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
+    # ---------------------------------------------------------------- 参数
+    - name: Resolve parameters
+      env:
+        IN_REPO: ${{ inputs.source_repo }}
+        IN_BRANCH: ${{ inputs.source_branch }}
+        IN_EXTRA: ${{ inputs.extra_packages }}
+        IN_RELEASE: ${{ inputs.release }}
+        IN_CCACHE: ${{ inputs.use_ccache }}
+        IN_DEBUG: ${{ inputs.debug_ssh }}
+      run: |
+        set -euo pipefail
+        repo="${IN_REPO:-$DEFAULT_REPO}"
+        branch="${IN_BRANCH:-$DEFAULT_BRANCH}"
+        rel="${IN_RELEASE:-false}"
+        cac="${IN_CCACHE:-true}"
+        dbg="${IN_DEBUG:-false}"
+        {
+          echo "REPO_URL=$repo"
+          echo "REPO_BRANCH=$branch"
+          echo "EXTRA_PACKAGES=$IN_EXTRA"
+          echo "UPLOAD_RELEASE=$rel"
+          echo "USE_CCACHE=$cac"
+          echo "DEBUG_SSH=$dbg"
+        } >> "$GITHUB_ENV"
+
+        {
+          echo "### 本次构建参数"
+          echo ""
+          echo "| 项 | 值 |"
+          echo "|---|---|"
+          echo "| 源码 | \`$repo\` @ \`$branch\` |"
+          echo "| 临时加包 | \`${IN_EXTRA:-（无）}\` |"
+          echo "| ccache | $cac |"
+          echo "| 发 Release | $rel |"
+          echo ""
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "REPO=$repo  BRANCH=$branch  CCACHE=$cac  RELEASE=$rel"
+
+    # ---------------------------------------------------------------- 环境
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
+        set -uo pipefail
+        # 释放磁盘：镜像预装的 SDK 对 OpenWrt 编译毫无用处
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL || true
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+
+        # 新版 runner（24.04 / 26.04）里有些老包已不存在（libncurses5-dev、python2.7 …），
+        # 这里先探测再装 —— 以后换 runner 版本不用改这份列表。
+        PKGS="ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 \
+        ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
+        git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+        libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev \
+        libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf \
+        python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools \
+        subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev"
+        INSTALL=""
+        SKIP=""
+        for p in $PKGS; do
+          if apt-cache show "$p" >/dev/null 2>&1; then INSTALL="$INSTALL $p"; else SKIP="$SKIP $p"; fi
+        done
+        apt-cache show libncurses5-dev >/dev/null 2>&1 || INSTALL="$INSTALL libncurses-dev"
+        if [ -n "$SKIP" ]; then echo "::notice::当前运行器没有这些包，已自动跳过：$SKIP"; fi
+        # shellcheck disable=SC2086
+        sudo -E apt-get -qq install $INSTALL
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
         sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+        sudo chown "$USER:$GROUPS" /workdir
         df -hT /
 
+    # ---------------------------------------------------------------- 源码
     - name: Clone source code
       working-directory: /workdir
       run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        df -hT "$PWD"
+        # --depth 1：只要最新快照，clone 时间从 ~20s 降到 ~5s。
+        # 若发现固件里的版本号/描述显示异常，去掉 --depth 1 即可。
+        git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
+        ln -sf /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
+        echo "UPSTREAM_SHA=$(git -C openwrt rev-parse HEAD)" >> "$GITHUB_ENV"
 
+    - name: Restore ccache
+      if: env.USE_CCACHE == 'true'
+      uses: actions/cache@v6
+      with:
+        path: /workdir/.ccache
+        # key 绑上游 commit：源码没变就复用同一份缓存，变了也能靠 restore-keys 命中旧对象
+        key: ccache-${{ env.REPO_BRANCH }}-${{ env.UPSTREAM_SHA }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ env.REPO_BRANCH }}-${{ env.UPSTREAM_SHA }}-
+          ccache-${{ env.REPO_BRANCH }}-
+
+    # ---------------------------------------------------------------- feeds
     - name: Load custom feeds
       run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
+        set -euo pipefail
+        if [ -e "$FEEDS_CONF" ]; then cp -f "$FEEDS_CONF" openwrt/feeds.conf.default; fi
+        chmod +x "$GITHUB_WORKSPACE/$DIY_P1_SH" "$GITHUB_WORKSPACE/scripts/"*.sh
         cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+        "$GITHUB_WORKSPACE/$DIY_P1_SH"
 
     - name: Update feeds
       run: cd openwrt && ./scripts/feeds update -a
@@ -79,199 +200,220 @@ jobs:
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a
 
+    # ---------------------------------------------------------------- 配置
     - name: Load custom configuration
       run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
+        set -euo pipefail
+        if [ -d files ]; then mv files openwrt/files; fi
 
-    # ------------------------------------------------------------------
-    # 关键补充步骤：记录你显式请求的每一项，defconfig 之后再逐项核对，
-    # 被丢弃的选项会直接写进本次运行的 Summary。
-    # ------------------------------------------------------------------
-    - name: Resolve .config and verify requested options
+        # 由 config/ 下的分层文件生成 openwrt/.config
+        ./scripts/gen-config.sh openwrt
+
+        # 机型无关的「改源码」动作（默认 LAN IP / 主机名…）
+        cd openwrt
+        "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+    - name: Pre-check requested packages
       run: |
-        set -u
+        OPENWRT_DIR=openwrt STRICT="$STRICT" ./scripts/check-packages.sh pre
+
+    # ---------------------------------------------------------------- 编译
+    - name: Resolve .config (make defconfig) and reconcile
+      id: defconfig
+      run: |
+        set -o pipefail
         cd openwrt
         cp .config /tmp/requested.config
-        sed -n 's/^\(CONFIG_[A-Za-z0-9_.+-]*\)=[ym]$/\1/p' /tmp/requested.config | sort -u > /tmp/requested.list
-
         make defconfig 2>&1 | tee /tmp/defconfig.log
-        grep -Ei 'warning|error|invalid' /tmp/defconfig.log > /tmp/defconfig.warn || true
-
-        MISSING=""
-        while IFS= read -r sym; do
-          [ -z "$sym" ] && continue
-          grep -q "^${sym}=[ym]$" .config || MISSING="$MISSING ${sym#CONFIG_}"
-        done < /tmp/requested.list
-
-        {
-          echo "### 配置解析报告"
-          echo ""
-          echo "- 请求的选项：$(wc -l < /tmp/requested.list) 个"
-          echo "- 解析后 .config 行数：$(wc -l < .config) 行"
-          echo ""
-          if [ -n "$MISSING" ]; then
-            echo "**被 make defconfig 丢弃的选项**（包不存在 / 依赖不满足 / 该行写法非法）："
-            echo ""
-            for m in $MISSING; do echo "- \`$m\`"; done
-          else
-            echo "全部生效 ✅"
-          fi
-          if [ -s /tmp/defconfig.warn ]; then
-            echo ""
-            echo "<details><summary>make defconfig 的警告</summary>"
-            echo ""
-            echo '```'
-            head -n 40 /tmp/defconfig.warn
-            echo '```'
-            echo ""
-            echo "</details>"
-          fi
-        } >> "$GITHUB_STEP_SUMMARY"
-
-        if [ -n "$MISSING" ]; then
-          echo "::warning::以下选项被丢弃：$MISSING"
-          if [ "$FAIL_ON_MISSING_PACKAGE" = "true" ]; then
-            echo "::error::存在被丢弃的包，按 FAIL_ON_MISSING_PACKAGE=true 中止"
-            exit 1
-          fi
-        fi
-
-        echo "=== 最终生效的关键项 ==="
-        grep -E '^CONFIG_TARGET_(x86|IMAGES|ROOTFS|KERNEL)|^CONFIG_PACKAGE_(luci|kmod|adguard|tailscale|openclash)' .config | head -n 40
-
         {
           echo ""
-          echo "### 关键开关复核（含显式关闭项）"
+          echo "### make defconfig 警告"
           echo ""
           echo '```'
-          grep -E '(openclash|adguardhome|ssr-plus)' .config || echo "(以上三项均未出现在最终 .config)"
+          grep -Ei 'warning|warn.*invalid|error' /tmp/defconfig.log | head -n 30 || echo "(无)"
           echo '```'
           echo ""
-          echo "> 注意：lede 的 DEFAULT_PACKAGES.router 自带 13 个 luci 应用，"
-          echo "> 它们不会出现在上面的「请求的选项」里，但会真的编进固件。"
-        } >> "$GITHUB_STEP_SUMMARY"
+        } >> "$GITHUB_STEP_SUMMARY" || true
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
-    - name: Download package
+    - name: Reconcile requested vs effective options
+      run: |
+        OPENWRT_DIR=openwrt STRICT="$STRICT" ./scripts/check-packages.sh post
+
+    - name: Show effective key options
       run: |
         cd openwrt
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+        {
+          echo ""
+          echo "### 最终生效的关键项"
+          echo ""
+          echo '```'
+          grep -E '^CONFIG_TARGET_|^CONFIG_PACKAGE_(luci-app|adguardhome|openclash|tailscale|kmod-virtio)' .config \
+            | head -n 40 || true
+          echo '```'
+          echo ""
+          echo "> lede 的 DEFAULT_PACKAGES.router 自带一批 luci 应用，它们不在你的 packages.txt 里，"
+          echo "> 但会真的编进固件 —— 想确认「真正装进镜像的包」，看最后的对账报告。"
+          echo ""
+        } >> "$GITHUB_STEP_SUMMARY" || true
+
+    - name: Download packages
+      run: |
+        cd openwrt
+        # 上游 mirror 偶发抖动：失败就退回单线程再试一次
+        make download -j8 || make download -j1 || echo "::warning::下载仍有失败项，继续编译（编译期会再取）"
+        find dl -size -1024c -exec ls -l {} \; || true
+        find dl -size -1024c -exec rm -f {} \; || true
 
     - name: Compile the firmware
       id: compile
       run: |
+        set -o pipefail
         cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        echo "=== $(nproc) 线程编译 ==="
+        if make -j"$(nproc)" 2>&1 | tee /tmp/build.log; then
+          echo "并行编译成功"
+        else
+          echo "::warning::并行编译失败，改用 -j1 V=s 重编，以定位第一个出错的文件"
+          make -j1 V=s 2>&1 | tee -a /tmp/build.log
+        fi
 
-    - name: Report built images and packages
+        ccache -s 2>/dev/null || true
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
+        if [ -s DEVICE_NAME ]; then echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"; fi
+        echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
+    # ---------------------------------------------------------------- 报告
+    - name: Report images and really-installed packages
       if: (!cancelled())
       run: |
         cd openwrt
         {
+          echo ""
           echo "### 镜像产物"
           echo ""
           echo '```'
-          find bin/targets -maxdepth 3 -type f \( -name '*.img*' -o -name '*.bin' \) -printf '%f\t%s\n' 2>/dev/null | sort || true
+          find bin/targets -maxdepth 3 -type f \( -name '*.img*' -o -name '*.bin' -o -name '*.itb' \) \
+            -printf '%f\t%s\n' 2>/dev/null | sort || true
           echo '```'
           echo ""
-          echo "### 与配置相关的插件是否真的编入"
+          echo "### 对账：请求的包有没有真正装进固件"
+          echo ""
+          echo "（依据 bin/targets 下的包清单；bin/packages 只是编译产物，不代表被安装）"
           echo ""
           echo '```'
-          find bin/packages -maxdepth 4 -type f \( -name '*.ipk' -o -name '*.apk' \) 2>/dev/null \
-            | sed 's|.*/||' | sort \
-            | grep -Ei 'luci-app-|luci-theme-|adguardhome|openclash|tailscale|ttyd|diskman|turboacc|istore|store' || echo "(没有匹配到，说明这些包根本没被编译)"
-          echo '```'
-        } >> "$GITHUB_STEP_SUMMARY"
-
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
-
-    - name: Upload bin directory
-      uses: actions/upload-artifact@v4
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
-
-    # ------------------------------------------------------------------
-    # 唯一能证明「某个包真的进了固件」的地方：bin/targets 下的包清单
-    # （bin/packages 只是编译产物，不代表被安装）
-    # 必须在 Organize files 的 rm -rf packages 之前执行
-    # ------------------------------------------------------------------
-    - name: Report packages installed into the image
-      if: (!cancelled())
-      run: |
-        cd openwrt
-        {
-          echo "### 真正装进固件的 luci 应用（bin/targets 包清单）"
-          echo ""
-          echo '```'
-          find bin/targets -type f \( -name 'luci-*.ipk' -o -name 'luci-*.apk' \) \
-            | sed 's|.*/||' | sort || true
-          echo '```'
-          echo ""
-          echo "### 对账：请求了但没进固件的"
-          echo ""
-          echo '```'
-          for p in luci-app-openclash luci-app-adguardhome adguardhome; do
-            if find bin/targets -type f \( -name "${p}_*.ipk" -o -name "${p}-*.apk" \) | grep -q .; then
+          awk -F= '$2=="y"{print $1}' /tmp/requested.list 2>/dev/null | while read -r p; do
+            case "$p" in kmod-*) continue ;; esac
+            if find bin/targets -type f \( -name "${p}_*" -o -name "${p}-*" \) 2>/dev/null | grep -q .; then
               echo "OK   $p"
             else
               echo "MISS $p"
             fi
           done
           echo '```'
-        } >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+        } >> "$GITHUB_STEP_SUMMARY" || true
 
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    # ---------------------------------------------------------------- 产物
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
+        set -euo pipefail
         cd openwrt/bin/targets/*/*
         rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
+        echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
     - name: Upload firmware directory
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
+        retention-days: ${{ env.ARTIFACT_RETENTION }}
 
     - name: Upload build logs on failure
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       if: failure()
       with:
         name: build-logs${{ env.FILE_DATE }}
         path: |
           openwrt/.config
           openwrt/logs/
+          /tmp/build.log
           /tmp/defconfig.log
         if-no-files-found: ignore
         retention-days: 5
 
+    - name: Diagnose failure
+      if: failure()
+      run: |
+        {
+          echo ""
+          echo "### 失败定位（自动摘录）"
+          echo ""
+          if [ -f /tmp/build.log ]; then
+            echo "- 编译日志：$(du -h /tmp/build.log | cut -f1)"
+            echo ""
+            echo "**最后的报错行：**"
+            echo ""
+            echo '```'
+            grep -nE 'Error [0-9]+|error:|fatal error|ld: ' /tmp/build.log | tail -n 15 || echo "(没抓到明显报错行)"
+            echo '```'
+            echo ""
+            echo "**最后涉及的包目录（多半就是它编不过）：**"
+            echo ""
+            echo '```'
+            grep -oE 'package/(feeds/[a-z0-9_-]+/)?[A-Za-z0-9._+-]+' /tmp/build.log | tail -n 5 || true
+            echo '```'
+            echo ""
+            echo "> 处理办法：多数是上游某个包本身编不过。把它的名字写进 \`config/packages.txt\` 并加 \`!\` 前缀"
+            echo "> （或先在 \`diy-part1.sh\` 去掉对应 feed），能立刻出一版可用的固件。"
+          else
+            echo "没有 /tmp/build.log，说明失败在编译之前的步骤，看上面第一个红叉的日志。"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY" || true
+
+    - name: Debug via SSH (tmate)
+      if: failure() && env.DEBUG_SSH == 'true'
+      uses: mxschmitt/action-tmate@v3
+      timeout-minutes: 30
+
+    # ---------------------------------------------------------------- Release
     - name: Generate release tag
       id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success' && !cancelled()
       run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
+        set -euo pipefail
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> "$GITHUB_OUTPUT"
+        {
+          echo "OpenWrt 云编译 · $REPO_URL @ \`$REPO_BRANCH\`"
+          echo ""
+          echo "- 上游 commit: \`$UPSTREAM_SHA\`"
+          echo "- 机型: x86_64 generic（详见 config/base.config）"
+          echo "- 构建时间: $(TZ=$TZ date +"%Y-%m-%d %H:%M")"
+          echo ""
+          echo "### 插件清单（config/packages.txt）"
+          echo '```'
+          cat config/packages.txt | grep -vE '^[[:space:]]*(#|$)' || true
+          echo '```'
+          echo ""
+          echo "### 镜像"
+          echo '```'
+          ls -lh "$FIRMWARE" | awk '{print $5"\t"$9}' || true
+          echo '```'
+        } > release.txt
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
     - name: Upload firmware to release
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       if: steps.tag.outputs.status == 'success' && !cancelled()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -280,17 +422,30 @@ jobs:
         body_path: release.txt
         files: ${{ env.FIRMWARE }}/*
 
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@main
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
-
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@master
+    # ---------------------------------------------------------------- 清理
+    - name: Clean old releases
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        ids=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq "sort_by(.created_at) | reverse | .[$KEEP_RELEASES:][] | .id" 2>/dev/null || true)
+        for id in $ids; do
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" >/dev/null 2>&1 || true
+        done
+        echo "已保留最新 $KEEP_RELEASES 个 release"
+
+    - name: Clean old workflow runs
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        wf="${GITHUB_WORKFLOW_REF##*/}"
+        wf="${wf%@*}"
+        ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?per_page=100&status=completed" \
+              --jq "[.workflow_runs[] | select(.id != ${GITHUB_RUN_ID})] | sort_by(.created_at) | reverse | .[$KEEP_RUNS:][] | .id" \
+              2>/dev/null || true)
+        for id in $ids; do
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" >/dev/null 2>&1 || true
+        done
+        echo "已保留最近 $KEEP_RUNS 次运行（含其 artifact）"

@@ -1,5 +1,7 @@
-.pat
-_repo/
-_push.diff
-*.bak
-.DS_Store
+# CI 里现场生成的配置 —— 唯一真相是 config/ 下那三份
+openwrt/
+/.config
+
+# 本地临时文件
+*.log
+.tmp-test/

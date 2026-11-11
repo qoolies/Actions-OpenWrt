@@ -1,63 +1,94 @@
 #
-# https://github.com/P3TERX/Actions-OpenWrt
-#
 # File: .github/workflows/update-checker.yml
-# Description: Source code update checker
+# Description: 源码更新检查 —— lede 有新的 commit 就触发一次编译
 #
-# 修改点：
-#   1. actions/cache v3 已弃用（官方 sunset），换成 v4
-#   2. peter-evans/repository-dispatch 升到 v3
-#   3. 增加 permissions，否则 repository-dispatch / 删除旧运行会因 token 权限不足报错
+# 改动点（对比 P3TERX 原版）：
+#   1. actions/cache v3（已停止服务）→ v6，peter-evans/repository-dispatch v2 → v4
+#   2. 补 permissions：缺了它们，触发 dispatch / 删旧运行会因 token 权限不足变红
+#   3. 删旧运行改用 gh API，不再依赖停更的 Mattraks/delete-workflow-runs
+#   4. 上游仓库/分支只在这一处，用 repo 变量 + 与 builder 保持一致
+#   5. schedule 默认关闭：想每天自动检查就取消注释
 #
 
 name: Update Checker
 
-env:
-  REPO_URL: https://github.com/coolsnowwolf/lede
-  REPO_BRANCH: master
-
 on:
   workflow_dispatch:
-#  schedule:
-#    - cron: 0 */18 * * *
+  # 想开启定时检查就取消下面两行注释（每 3 天 18:00 UTC 检查一次）
+  # schedule:
+  #   - cron: '0 18 */3 * *'
 
 permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: update-checker
+  cancel-in-progress: true
+
+env:
+  # 必须与 openwrt-builder.yml 里的 DEFAULT_REPO / DEFAULT_BRANCH 一致
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+
 jobs:
   check:
     runs-on: ubuntu-latest
-
     steps:
 
-    - name: Get Commit Hash
+    - name: Get upstream commit hash
       id: getHash
       run: |
-        git clone --depth 1 $REPO_URL -b $REPO_BRANCH .
-        echo "commitHash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+        set -euo pipefail
+        git clone --depth 1 --no-checkout "$REPO_URL" -b "$REPO_BRANCH" src
+        sha="$(git -C src rev-parse HEAD)"
+        echo "commitHash=$sha" >> "$GITHUB_OUTPUT"
+        echo "上游 $REPO_BRANCH 最新 commit：$sha"
 
-    - name: Compare Commit Hash
+    - name: Compare with last seen hash
       id: cacheHash
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: .commitHash
         key: commitHash_${{ steps.getHash.outputs.commitHash }}
 
-    - name: Save New Commit Hash
+    - name: Save new commit hash
       if: steps.cacheHash.outputs.cache-hit != 'true'
-      run: |
-        echo ${{ steps.getHash.outputs.commitHash }} | tee .commitHash
+      run: echo "${{ steps.getHash.outputs.commitHash }}" | tee .commitHash
 
     - name: Trigger build
       if: steps.cacheHash.outputs.cache-hit != 'true'
-      uses: peter-evans/repository-dispatch@v3
+      uses: peter-evans/repository-dispatch@v4
       with:
         token: ${{ github.token }}
         event-type: Source Code Update
+        client-payload: '{"repo":"${{ env.REPO_URL }}","branch":"${{ env.REPO_BRANCH }}","sha":"${{ steps.getHash.outputs.commitHash }}"}'
 
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@v2
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
+    - name: Summary
+      run: |
+        {
+          echo "### 更新检查"
+          echo ""
+          echo "- 上游：\`$REPO_URL\` @ \`$REPO_BRANCH\`"
+          echo "- 最新 commit：\`${{ steps.getHash.outputs.commitHash }}\`"
+          if [ "${{ steps.cacheHash.outputs.cache-hit }}" = "true" ]; then
+            echo "- 结论：与上次相同，**未触发编译**"
+          else
+            echo "- 结论：**有新提交，已触发 OpenWrt Builder**"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Clean old workflow runs
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        wf="${GITHUB_WORKFLOW_REF##*/}"
+        wf="${wf%@*}"
+        ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?per_page=100&status=completed" \
+              --jq "[.workflow_runs[] | select(.id != ${GITHUB_RUN_ID})] | sort_by(.created_at) | reverse | .[3:][] | .id" \
+              2>/dev/null || true)
+        for id in $ids; do
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" >/dev/null 2>&1 || true
+        done
+        echo "已保留最近 3 次检查记录"
