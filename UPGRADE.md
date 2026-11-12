@@ -118,7 +118,44 @@ luci-app-openclash          # 启用
 - 并给出可直接执行的处理建议（把该包 `!` 掉再跑）
 - 需要人工进容器时勾 `debug_ssh`，tmate 直接给 SSH 地址
 
-### 2.7 其它小修
+### 2.8 网络加速（老 TurboACC）：上游没了页面，功能还在
+
+上游 2026-10-29 把 `luci-app-turboacc` 从 `luci@openwrt-25.12` 移除，全锥形 NAT、
+TCP 拥塞控制、流量卸载都并进了 **LuCI → 网络 → 防火墙 → 常规设置**。
+页面上那几项只有在固件带对应内核模块时才显示（LuCI 的 `getFeatures` 靠
+`/sys/module/<名字>` 探测）：
+
+| 页面选项 | 需要的包 | 上游在 25.12 里有吗 |
+|---|---|---|
+| 启用 FullCone NAT（FULLCONENAT / Broadcom Fullcone NAT1） | `kmod-nft-fullcone` | ✅ `package/network/services/fullconenat-nft` |
+| 流量卸载 → 软件流量卸载 | `kmod-nft-offload` | ✅ `package/kernel/linux` |
+| TCP CCA → bbr | `kmod-tcp-bbr` | ✅ `package/kernel/linux` |
+
+所以「TurboACC 编不进去」这件事的正确解法**不是**去第三方仓库打内核补丁，
+只要把这三个 `kmod-*` 写进 `config/packages.txt`，再用
+`files/etc/uci-defaults/99-turboacc` 把默认值设好（全锥 + 软件卸载 + bbr）。
+真想要那个独立页面，才需要 [mufeng05/turboacc](https://github.com/mufeng05/turboacc)
+那种带内核补丁的仓库，风险见 README。
+
+### 2.9 预检的假阳性：feed 包被误报「找不到」
+
+`feeds install` 装进 `package/feeds/<feed>/<包>` 的是**符号链接**，
+`find -type d` 默认不跟随符号链接 → `luci-app-openclash`、`luci-app-adguardhome`、
+`adguardhome` 全被误报成「源码树里找不到」。已改成 `find -L`，并加了 feed 索引兜底；
+`kmod_names()` 也从只扫 `package/kernel` 改成扫整棵 `package/`（`kmod-nft-fullcone`
+这种定义在 `package/network/services/fullconenat-nft` 里）。
+
+### 2.10 ccache 改成「可观测」
+
+缓存到底有没有生效，从 Actions 日志里看不出来（日志要登录）。现在：
+
+- `actions/cache` 拆成 `restore` + `save` 两步，保存时机确定
+- 编译后自动自检，结果直接进 annotation：
+  `::warning::.config 里没有 CONFIG_CCACHE=y` / `::warning::.ccache 是空的` /
+  `::notice::ccache 生效：目录 1.8G`
+- Summary 里同时有一张 ccache 自检表
+
+### 2.11 其它小修
 
 - `diy-part1.sh`：`add_feed` / `add_flat_feed` 两个幂等函数，重复执行不会把 feed 写两遍；
   iStore 摊平从「一次性命令」变成「取消注释一行」

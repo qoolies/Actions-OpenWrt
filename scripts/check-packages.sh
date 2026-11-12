@@ -31,11 +31,15 @@ if [ ! -s "$REQ" ]; then
 fi
 
 pkg_dirs() {  # 源码树里所有包目录名
-    find "$OPENWRT/package" -maxdepth 5 -type d -printf '%f\n' 2>/dev/null | tr -d '\r' | sort -u
+    # -L 不能省：feeds install 装进 package/feeds/<feed>/<包> 的是**符号链接**，
+    # 少了 -L 时 `-type d` 会把它们全部跳过 —— 表现就是「明明有的包被报成找不到」
+    # （luci-app-openclash / luci-app-adguardhome / adguardhome 就这么被误报过一次）
+    find -L "$OPENWRT/package" -maxdepth 5 -type d -printf '%f\n' 2>/dev/null | tr -d '\r' | sort -u
 }
 kmod_names() {  # 内核模块定义名（kmod-xxx 去掉 kmod- 前缀）
     # 源码里的写法是 `define KernelPackage/virtio-net`（斜杠，不是空格）
-    grep -rhsE '^define[[:space:]]+KernelPackage/' "$OPENWRT/package/kernel" 2>/dev/null |
+    # 扫整棵 package/ 而不是只扫 package/kernel：kmod-nft-fullcone 这类定义在别处
+    grep -RhsE '^define[[:space:]]+KernelPackage/' "$OPENWRT/package" 2>/dev/null |
         sed -e 's/#.*//' -e 's/^define[[:space:]]*KernelPackage\///' -e 's/[[:space:]]*$//' |
         tr -d '\r' | sort -u
 }
@@ -74,6 +78,9 @@ if [ "$STAGE" = "pre" ]; then
         done
         printf '%s' "${out# }"
     }
+    in_index() {  # $1=包名 → 是否出现在任一 feed 的索引里（兜底：feeds install 偶尔没装进 package/）
+        grep -qxF "$1" "$IDXDIR"/* 2>/dev/null
+    }
     MULTI=""
 
     MISSING=""
@@ -85,7 +92,7 @@ if [ "$STAGE" = "pre" ]; then
     while IFS='=' read -r name val; do
         [ -z "${name:-}" ] && continue
         val="${val//$'\r'/}"
-        if grep -qxF "$name" "$DIRS"; then
+        if grep -qxF "$name" "$DIRS" || in_index "$name"; then
             OK=$((OK + 1))
             srcs="$(sources_of "$name")"
             [ "$(printf '%s' "$srcs" | wc -w)" -ge 2 ] && MULTI="$MULTI $name"

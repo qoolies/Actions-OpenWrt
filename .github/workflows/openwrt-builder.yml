@@ -174,8 +174,9 @@ jobs:
         echo "UPSTREAM_SHA=$(git -C openwrt rev-parse HEAD)" >> "$GITHUB_ENV"
 
     - name: Restore ccache
+      id: ccache
       if: env.USE_CCACHE == 'true'
-      uses: actions/cache@v6
+      uses: actions/cache/restore@v6
       with:
         # 注意：lede 的 rules.mk 里是无条件 `export CCACHE_DIR=$(TOPDIR)/.ccache`
         # （见 include 里的 CCACHE 段），环境变量会被它覆盖 —— 所以缓存必须放在
@@ -208,6 +209,11 @@ jobs:
       run: |
         set -euo pipefail
         if [ -d files ]; then mv files openwrt/files; fi
+        # Windows 上 checkout 出来的可执行位不可靠：uci-defaults 里的脚本必须带 +x，
+        # 否则只会被当普通文件拷进固件、首次启动不执行（防火墙加速的默认值就丢了）
+        if [ -d openwrt/files/etc/uci-defaults ]; then
+          find openwrt/files/etc/uci-defaults -type f -exec chmod +x {} \;
+        fi
 
         # 由 config/ 下的分层文件生成 openwrt/.config
         ./scripts/gen-config.sh openwrt
@@ -305,6 +311,43 @@ jobs:
           echo "> 所以缓存目录只能是 \`openwrt/.ccache\`，写别处会「看起来配了、实际全量编译」。"
           echo ""
         } >> "$GITHUB_STEP_SUMMARY" || true
+
+    # 缓存到底有没有生效，变成一条可公开查询的 annotation：
+    # Actions 日志要登录才能看，::warning:: / ::notice:: 不用登录也能拿到。
+    - name: Check ccache is really used
+      id: ccachecheck
+      if: env.USE_CCACHE == 'true' && !cancelled()
+      run: |
+        cd openwrt
+        cfg="$(grep -E '^CONFIG_CCACHE=' .config || echo '(没有 CONFIG_CCACHE 这一行)')"
+        size="$(du -sh .ccache 2>/dev/null | cut -f1 || true)"
+        have=no
+        if [ -d .ccache ] && [ -n "$(ls -A .ccache 2>/dev/null)" ]; then have=yes; fi
+        echo "have=$have" >> "$GITHUB_OUTPUT"
+        {
+          echo ""
+          echo "### ccache 自检"
+          echo ""
+          echo "| 项 | 值 |"
+          echo "|---|---|"
+          echo "| \`.config\` | \`$cfg\` |"
+          echo "| 目录大小 | ${size:-（目录不存在）} |"
+          echo ""
+        } >> "$GITHUB_STEP_SUMMARY" || true
+        if ! grep -q '^CONFIG_CCACHE=y' .config; then
+          echo "::warning::.config 里没有 CONFIG_CCACHE=y（$cfg），ccache 没参与编译：检查 config/base.config"
+        elif [ "$have" = "no" ]; then
+          echo "::warning::CONFIG_CCACHE=y 但 openwrt/.ccache 是空的，没有可保存的缓存（下次还是全量编译）"
+        else
+          echo "::notice::ccache 生效：目录 $size，本次结束后存成缓存"
+        fi
+
+    - name: Save ccache
+      if: always() && env.USE_CCACHE == 'true' && steps.ccachecheck.outputs.have == 'yes'
+      uses: actions/cache/save@v6
+      with:
+        path: /workdir/openwrt/.ccache
+        key: ccache-${{ env.REPO_BRANCH }}-${{ env.UPSTREAM_SHA }}-${{ github.run_id }}
 
     # ---------------------------------------------------------------- 报告
     - name: Report images and really-installed packages

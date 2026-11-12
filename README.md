@@ -121,7 +121,7 @@ passwall  https://github.com/xiaorouji/openwrt-passwall
 "包找不到"时的判断顺序：
 1. 名字拼错了？预检会给近似名
 2. 包在别的仓库？→ 上面这样加 feed
-3. 该分支确实移除了（如 `luci-app-turboacc` 在 luci@25.12 被移除）→ 删掉这一行
+3. 该分支确实移除了（`luci-app-turboacc` 就是这样消失的，等价功能见「网络加速」一节）→ 删掉这一行
 
 ### 装 iStore 应用商店
 
@@ -185,6 +185,27 @@ istore  https://github.com/istoreos/istore.git flatten=luci
 - 大的：`diy-part2.sh` 里直接 `rm -rf` 掉整个包目录（比在 .config 里关更快、不会有残留依赖）
 - 更彻底：`config/base.config` 里把 `CONFIG_TARGET_ROOTFS_PARTSIZE` 从 2048 降到 1024
 
+### 网络加速（老 TurboACC 的那几项）
+
+上游 2026-10-29 把 `luci-app-turboacc` 从 `luci@openwrt-25.12` 删了，全锥形 NAT、
+TCP 拥塞控制、流量卸载全部搬进 **LuCI → 网络 → 防火墙 → 常规设置**。
+页面上那些开关只有在固件带对应内核模块时才显示（LuCI 靠 `/sys/module/<名字>` 探测），
+所以要在 `config/packages.txt` 里确保这三行：
+
+| 页面选项 | 包 |
+|---|---|
+| 启用 FullCone NAT（FULLCONENAT / Broadcom Fullcone NAT1） | `kmod-nft-fullcone` |
+| 流量卸载 → 软件流量卸载 | `kmod-nft-offload` |
+| TCP CCA → bbr | `kmod-tcp-bbr` |
+
+默认值由 `files/etc/uci-defaults/99-turboacc` 在首次启动时写入
+（`fullcone=1`、`flow_offloading=1`、`tcpcca=bbr`、`fullcone6=0`、硬件卸载关 —— x86 没有卸载单元）。
+刷机后想改回 cubic、或者关掉全锥，直接在防火墙页面上改即可，不会被覆盖。
+
+**不要**为了那个独立页面去加第三方 turboacc 仓库：它们要往 `target/linux/generic/hack-*`
+里塞内核补丁、还要改 `nftables` / `libnftnl` / `firewall4` 的源码包，
+内核一改 ccache 也就废了，收益只是「界面上多一个页面」。
+
 ### 锁定上游版本（防「今天能过明天过不了」）
 
 lede master 每天在变。要稳定就钉版本：
@@ -218,4 +239,7 @@ lede master 每天在变。要稳定就钉版本：
 - **同名包不会互相打架**：`feeds install -a` 是先到先得，`feeds.conf` 里靠前的 feed 优先，
   核心包（`package/`）又高于所有 feed。额外 feed 追加在最后，所以默认源天然优先；
   预检的「包的来源」表会列出每个包最终来自哪个源。
-- 当前 lede 的 luci feed 锁在 **openwrt-25.12** 分支：`luci-app-turboacc`、`luci-app-accesscontrol` 在该分支已被移除，写了也只会进「找不到」报告。
+- 当前 lede 的 luci feed 锁在 **openwrt-25.12** 分支：`luci-app-turboacc`、`luci-app-accesscontrol` 在该分支已被移除；
+  加速类功能已并入防火墙页面（见「网络加速」一节），不要再去找 `luci-app-turboacc`。
+- **feed 里的包目录是符号链接**：`find package -type d` 看不到它们，脚本里必须用 `find -L`，
+  否则「明明装好的包」会被报成找不到。

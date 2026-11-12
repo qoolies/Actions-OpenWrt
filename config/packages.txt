@@ -19,6 +19,18 @@ luci-app-openclash
 luci-app-adguardhome
 adguardhome
 
+# ----- 网络加速（= 老的 TurboACC 那几个开关，上游已并入「防火墙」页面）-----
+# 2026-10-29 上游把 luci-app-turboacc 从 luci@openwrt-25.12 移除了：全锥形 NAT、
+# TCP 拥塞控制、流量卸载都搬进了 LuCI → 网络 → 防火墙 → 常规设置。
+# 页面上那几项「看不看得见」取决于固件里有没有对应内核模块（LuCI 靠 /sys/module/<名> 探测）：
+#   kmod-nft-fullcone   启用 FullCone NAT（FULLCONENAT / Broadcom Fullcone NAT1）
+#   kmod-nft-offload    软件流量卸载（Flow Offloading）
+#   kmod-tcp-bbr        TCP CCA 里的 bbr
+# 默认值（全锥 NAT + 软件卸载 + bbr）由 files/etc/uci-defaults/99-turboacc 写进去。
+kmod-nft-fullcone
+kmod-nft-offload
+kmod-tcp-bbr
+
 # ----- 虚拟化网卡 -----
 # PVE 用 VirtIO 网卡时需要；若内核已内建，这一行会被 defconfig 丢弃，属正常
 kmod-virtio-net
@@ -30,7 +42,7 @@ kmod-virtio-net
 # ===========================================================================
 # 下面这些是「拿不到」的，留作备注，别取消注释（否则只会进「被丢弃」报告）：
 #
-#   luci-app-turboacc       luci feed 的 openwrt-25.12 分支已移除
+#   luci-app-turboacc       上游已移除，别写；等价功能见上面的 kmod-* 三行
 #   luci-app-accesscontrol  同上，25.12 分支已移除
 #   luci-theme-argon        ← 其实存在（luci 的 themes/ 里），需要主题就取消注释
 #   luci-app-diskman        ← 存在，装硬盘管理工具时取消注释
